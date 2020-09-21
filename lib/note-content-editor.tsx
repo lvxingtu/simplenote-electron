@@ -5,12 +5,18 @@ import Monaco, {
   EditorDidMount,
   EditorWillMount,
 } from 'react-monaco-editor';
-import { editor as Editor, Selection, SelectionDirection } from 'monaco-editor';
-import { search } from './state/ui/actions';
+import {
+  editor as Editor,
+  languages,
+  Selection,
+  SelectionDirection,
+} from 'monaco-editor';
 
+import { searchNotes, tagsFromSearch } from './search';
 import actions from './state/actions';
 import * as selectors from './state/selectors';
 import { getTerms } from './utils/filter-notes';
+import { noteTitleAndPreview } from './utils/note-utils';
 import { isSafari } from './utils/platform';
 import {
   withCheckboxCharacters,
@@ -90,6 +96,8 @@ type OwnState = {
   selectedSearchMatchIndex: number | null;
 };
 
+let hasCompletionProvider = false;
+
 class NoteContentEditor extends Component<Props> {
   bootTimer: ReturnType<typeof setTimeout> | null = null;
   editor: Editor.IStandaloneCodeEditor | null = null;
@@ -163,6 +171,77 @@ class NoteContentEditor extends Component<Props> {
     } else {
       window.removeEventListener('keydown', this.handleShortcut, true);
     }
+  };
+
+  completionProvider: languages.CompletionItemProvider = {
+    provideCompletionItems(model, position, context, token) {
+      const line = model.getLineContent(position.lineNumber);
+      if (!line.includes('[')) {
+        return null;
+      }
+
+      const precedingOpener = line.lastIndexOf('[', position.column);
+      const precedingCloser = line.lastIndexOf(']', position.column);
+      const precedingBracket =
+        precedingOpener >= 0 && precedingCloser < precedingOpener
+          ? precedingOpener
+          : -1;
+
+      const soFar =
+        precedingBracket >= 0
+          ? line.slice(precedingBracket + 1, position.column)
+          : '';
+
+      const notes = searchNotes(
+        {
+          searchTerms: getTerms(soFar),
+          openedTag: null,
+          showTrash: false,
+          searchTags: tagsFromSearch(soFar),
+        },
+        5
+      ).map(([noteId, note]) => ({
+        noteId,
+        content: note.content,
+        isPinned: note.systemTags.includes('pinned'),
+        ...noteTitleAndPreview(note),
+      }));
+
+      const additionalTextEdits =
+        precedingBracket >= 0
+          ? [
+              {
+                text: '',
+                range: {
+                  startLineNumber: position.lineNumber,
+                  startColumn: precedingBracket,
+                  endLineNumber: position.lineNumber,
+                  endColumn: position.column,
+                },
+              },
+            ]
+          : [];
+
+      return {
+        suggestions: notes.map((note, index) => ({
+          additionalTextEdits,
+          kind: note.isPinned
+            ? languages.CompletionItemKind.Snippet
+            : languages.CompletionItemKind.File,
+          label: note.title,
+          // detail: note.preview,
+          documentation: note.content,
+          insertText: `[${note.title}](simplenote://note/${note.noteId})`,
+          sortText: index.toString(),
+          range: {
+            startLineNumber: position.lineNumber,
+            startColumn: position.column,
+            endLineNumber: position.lineNumber,
+            endColumn: position.column,
+          },
+        })),
+      };
+    },
   };
 
   handleShortcut = (event: KeyboardEvent) => {
@@ -424,6 +503,14 @@ class NoteContentEditor extends Component<Props> {
   editorReady: EditorDidMount = (editor, monaco) => {
     this.editor = editor;
     this.monaco = monaco;
+
+    if (!hasCompletionProvider) {
+      hasCompletionProvider = true;
+      monaco.languages.registerCompletionItemProvider(
+        'plaintext',
+        this.completionProvider
+      );
+    }
 
     // remove keybindings; see https://github.com/microsoft/monaco-editor/issues/287
     const shortcutsToDisable = [
@@ -911,7 +998,7 @@ class NoteContentEditor extends Component<Props> {
               minimap: { enabled: false },
               occurrencesHighlight: false,
               overviewRulerBorder: false,
-              quickSuggestions: false,
+              quickSuggestions: true,
               renderIndentGuides: false,
               renderLineHighlight: 'none',
               scrollbar: {
@@ -975,7 +1062,7 @@ const mapStateToProps: S.MapState<StateProps> = (state) => ({
 });
 
 const mapDispatchToProps: S.MapDispatch<DispatchProps> = {
-  clearSearch: () => dispatch(search('')),
+  clearSearch: () => actions.ui.search(''),
   editNote: actions.data.editNote,
   insertTask: () => ({ type: 'INSERT_TASK' }),
   storeEditorSelection: (noteId, start, end, direction) => ({
